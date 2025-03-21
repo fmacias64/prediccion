@@ -2,6 +2,8 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, conlist
 import mysql.connector
 from dotenv import load_dotenv
+from datetime import datetime
+import json
 import os
 
 # Cargar variables de entorno desde un archivo .env
@@ -65,18 +67,46 @@ def calcular_puntaje(propuesta_usuario, veces_ganadas, veces_participadas, alpha
     
     score = alpha * (1 / propuesta_usuario) + (1 - alpha) * tasa_exito
     return score
+# Función para registrar solicitudes en log_solicitudes
+def registrar_log_solicitud(licitacion_id, competidores, consorcios_identificados):
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    query = '''
+        INSERT INTO log_solicitudes (licitacion_id, json_concursantes, fecha_hora, consorcios_identificados)
+        VALUES (%s, %s, %s, %s)
+    '''
+    valores = (licitacion_id, json.dumps([c.dict() for c in competidores]), datetime.now(), consorcios_identificados)
+
+    cursor.execute(query, valores)
+    conn.commit()
+    conn.close()
+
+# Función para registrar consorcios identificados
+def registrar_consorcio(licitacion_id, empresas, propuesta_comun):
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    query = '''
+        INSERT INTO consorcios_p (licitacion_id, empresas, propuesta_comun)
+        VALUES (%s, %s, %s)
+    '''
+    valores = (licitacion_id, json.dumps(empresas), propuesta_comun)
+
+    cursor.execute(query, valores)
+    conn.commit()
+    conn.close()
 
 @app.post("/evaluar-propuestas/", response_model=list[EmpresaSeleccionada])
 async def evaluar_propuestas(solicitud: SolicitudPropuestas):
     competidores_ids = [c.id_competidor for c in solicitud.competidores]
-    
+
     # Consultar MySQL para obtener datos históricos
     propuestas_bd = consultar_propuestas(competidores_ids)
     if not propuestas_bd:
         raise HTTPException(status_code=404, detail="No se encontraron datos para los competidores dados.")
-    
-    # Determinar 'n' según la cantidad de competidores
-    # Determinar 'n' según la cantidad de competidores
+
+    # Determinar 'n'
     num_competidores = len(solicitud.competidores)
     if num_competidores == 3:
         n = 2
@@ -85,10 +115,10 @@ async def evaluar_propuestas(solicitud: SolicitudPropuestas):
     elif num_competidores >= 6:
         n = 4
     else:
-        n = 2  # Valor por defecto
+        n = 2
 
-    
     resultados = []
+    propuestas_dict = {}
     for prop in propuestas_bd:
         comp_input = next((c for c in solicitud.competidores if c.id_competidor == prop['id_competidor']), None)
         if comp_input:
@@ -98,7 +128,20 @@ async def evaluar_propuestas(solicitud: SolicitudPropuestas):
                 "propuesta_economica": comp_input.propuesta_economica,
                 "puntaje": puntaje
             })
-    
-    # Ordenar por puntaje y seleccionar los mejores 'n'
+            # Agrupar propuestas para detectar consorcios
+            prop_key = round(comp_input.propuesta_economica, 2)
+            propuestas_dict.setdefault(prop_key, []).append(prop['id_competidor'])
+
+    # Identificar y registrar consorcios
+    consorcios_identificados = 0
+    for propuesta_comun, empresas in propuestas_dict.items():
+        if len(empresas) > 1:
+            registrar_consorcio(solicitud.licitacion_id, empresas, propuesta_comun)
+            consorcios_identificados += 1
+
+    # Registrar log de la solicitud
+    registrar_log_solicitud(solicitud.licitacion_id, solicitud.competidores, consorcios_identificados)
+
+    # Ordenar y retornar los mejores 'n'
     resultados.sort(key=lambda x: x["puntaje"], reverse=True)
     return resultados[:n]
